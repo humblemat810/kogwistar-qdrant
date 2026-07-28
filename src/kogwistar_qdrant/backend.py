@@ -77,7 +77,8 @@ class QdrantBackend:
 
     @classmethod
     def local(cls, path: str | None = None, **kwargs: Any) -> "QdrantBackend":
-        return cls(QdrantClient(location=":memory:" if path is None else path), **kwargs)
+        client = QdrantClient(location=":memory:") if path is None else QdrantClient(path=path)
+        return cls(client, **kwargs)
 
     @classmethod
     def remote(cls, url: str, **kwargs: Any) -> "QdrantBackend":
