@@ -7,6 +7,13 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  test:
+    build: .
+    depends_on:
+      - qdrant
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    command: ["python", "-m", "pytest", "-q"]
+
 volumes:
   qdrant_data:
-
