@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import Any, Iterator, Mapping, Sequence
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from qdrant_client import QdrantClient, models
 
@@ -10,6 +11,7 @@ COLLECTIONS = (
     "node_docs", "node_refs", "edge_refs",
 )
 DOCUMENT_KEY = "__gke_document"
+ID_KEY = "__gke_id"
 DIMENSION = 3
 SENTINEL = [0.0] * DIMENSION
 
@@ -100,7 +102,12 @@ class QdrantBackend:
     def _point(self, id_: str, document: str, metadata: Mapping[str, Any], vector: Sequence[float] | None) -> models.PointStruct:
         payload = dict(metadata)
         payload[DOCUMENT_KEY] = document
-        return models.PointStruct(id=id_, vector=list(vector or [0.0] * self.dimension), payload=payload)
+        payload[ID_KEY] = id_
+        return models.PointStruct(id=str(uuid5(NAMESPACE_URL, f"kogwistar:{id_}")), vector=list(vector or [0.0] * self.dimension), payload=payload)
+
+    @staticmethod
+    def _provider_id(id_: str) -> str:
+        return str(uuid5(NAMESPACE_URL, f"kogwistar:{id_}"))
 
     def _scroll(self, key: str, where: Mapping[str, Any] | None, limit: int, include: set[str]) -> list[Any]:
         points, _ = self.client.scroll(
@@ -112,7 +119,14 @@ class QdrantBackend:
     @staticmethod
     def _payload(point: Any) -> tuple[str | None, dict[str, Any]]:
         payload = dict(point.payload or {})
-        return payload.pop(DOCUMENT_KEY, None), payload
+        document = payload.pop(DOCUMENT_KEY, None)
+        payload.pop(ID_KEY, None)
+        return document, payload
+
+    @staticmethod
+    def _external_id(point: Any) -> str:
+        payload = point.payload or {}
+        return str(payload.get(ID_KEY, point.id))
 
     def _flat(self, points: Sequence[Any], include: set[str]) -> dict[str, Any]:
         docs, metas, vectors = [], [], []
@@ -121,7 +135,7 @@ class QdrantBackend:
             docs.append(document)
             metas.append(metadata)
             vectors.append(list(point.vector) if point.vector is not None and not isinstance(point.vector, dict) else None)
-        out: dict[str, Any] = {"ids": [str(point.id) for point in points]}
+        out: dict[str, Any] = {"ids": [self._external_id(point) for point in points]}
         if "documents" in include:
             out["documents"] = docs
         if "metadatas" in include:
@@ -132,7 +146,8 @@ class QdrantBackend:
 
     def get(self, key: str, *, ids: Sequence[str] | None = None, where: Mapping[str, Any] | None = None, include: Sequence[str] | None = None, limit: int = 200) -> dict[str, Any]:
         inc = self._include(include)
-        points = self.client.retrieve(collection_name=self._name(key), ids=list(ids), with_payload=True, with_vectors=("embeddings" in inc)) if ids is not None else self._scroll(key, where, limit, inc)
+        provider_ids = [self._provider_id(id_) for id_ in ids] if ids is not None else None
+        points = self.client.retrieve(collection_name=self._name(key), ids=provider_ids, with_payload=True, with_vectors=("embeddings" in inc)) if provider_ids is not None else self._scroll(key, where, limit, inc)
         return self._flat(points, inc)
 
     def query(self, key: str, *, query_embeddings: Sequence[Sequence[float]] | None = None, n_results: int = 10, where: Mapping[str, Any] | None = None, include: Sequence[str] | None = None) -> dict[str, Any]:
@@ -141,7 +156,7 @@ class QdrantBackend:
             flat = self._flat(self._scroll(key, where, n_results, inc), inc)
             return {name: [value] for name, value in flat.items()}
         batches = [self.client.query_points(collection_name=self._name(key), query=list(vector), query_filter=_filter(where), limit=n_results, with_payload=True, with_vectors=("embeddings" in inc)).points for vector in query_embeddings]
-        out: dict[str, Any] = {"ids": [[str(point.id) for point in batch] for batch in batches]}
+        out: dict[str, Any] = {"ids": [[self._external_id(point) for point in batch] for batch in batches]}
         if "documents" in inc:
             out["documents"] = [[self._payload(point)[0] for point in batch] for batch in batches]
         if "metadatas" in inc:
@@ -172,9 +187,14 @@ class QdrantBackend:
             self.upsert(key, ids=[id_], documents=[document], metadatas=[metadata], embeddings=[vector])
 
     def delete(self, key: str, *, ids: Sequence[str] | None = None, where: Mapping[str, Any] | None = None) -> None:
-        target_ids = list(ids) if ids is not None else [str(point.id) for point in self._scroll(key, where, 10000, set())]
+        target_ids = [self._provider_id(id_) for id_ in ids] if ids is not None else [str(point.id) for point in self._scroll(key, where, 10000, set())]
         if target_ids:
             self.client.delete(collection_name=self._name(key), points_selector=models.PointIdsList(points=target_ids), wait=True)
+
+    def call(self, collection_key: str, method: str, **kwargs: Any) -> Any:
+        if collection_key not in COLLECTIONS or method not in {"get", "query", "add", "upsert", "update", "delete"}:
+            raise ValueError(f"unsupported collection/method: {collection_key}.{method}")
+        return getattr(self, f"{collection_key}_{method}")(**kwargs)
 
     def __getattr__(self, name: str) -> Any:
         for key in COLLECTIONS:
@@ -182,4 +202,3 @@ class QdrantBackend:
                 method = name[len(key) + 1:]
                 return lambda **kwargs: getattr(self, method)(key, **kwargs)
         raise AttributeError(name)
-
