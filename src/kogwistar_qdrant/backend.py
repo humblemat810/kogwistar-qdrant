@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Iterator, Mapping, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from qdrant_client import QdrantClient, models
+try:
+    from qdrant_client import QdrantClient, models
+except ImportError:  # PyPy provider-free compatibility lane
+    QdrantClient = None  # type: ignore[assignment]
+    models = None  # type: ignore[assignment]
 
 try:
     from kogwistar.engine_core.embedding_profile import EmbeddingStorageState
@@ -30,6 +34,12 @@ ID_KEY = "__gke_id"
 PENDING_KEY = "__gke_embedding_pending"
 DIMENSION = 3
 SENTINEL = [0.0] * DIMENSION
+
+
+def _require_qdrant() -> Any:
+    if QdrantClient is None:
+        raise RuntimeError("qdrant-client is unavailable on this interpreter; install provider dependencies on CPython")
+    return QdrantClient
 
 
 class NoopUnitOfWork:
@@ -140,14 +150,16 @@ class QdrantBackend:
 
     @classmethod
     def local(cls, path: str | None = None, **kwargs: Any) -> "QdrantBackend":
-        client = QdrantClient(location=":memory:") if path is None else QdrantClient(path=path)
+        client_type = _require_qdrant()
+        client = client_type(location=":memory:") if path is None else client_type(path=path)
         scope = f"qdrant:memory:{kwargs.get('prefix', 'kogwistar')}" if path is None else f"qdrant:path:{hashlib.sha256(str(Path(path).resolve()).encode()).hexdigest()[:16]}"
         return cls(client, storage_scope=scope, persistent=path is not None, **kwargs)
 
     @classmethod
     def remote(cls, url: str, **kwargs: Any) -> "QdrantBackend":
+        client_type = _require_qdrant()
         scope = f"qdrant:url:{hashlib.sha256(url.encode()).hexdigest()[:16]}"
-        return cls(QdrantClient(url=url), storage_scope=scope, persistent=True, **kwargs)
+        return cls(client_type(url=url), storage_scope=scope, persistent=True, **kwargs)
 
     def embedding_storage_scope(self) -> str:
         return self._storage_scope
