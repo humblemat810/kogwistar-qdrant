@@ -1,0 +1,43 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.12"
+            experimental: false
+            is_pypy: false
+          - python-version: "3.13"
+            experimental: false
+            is_pypy: false
+          - python-version: "3.14"
+            experimental: false
+            is_pypy: false
+          - python-version: "pypy3.11"
+            experimental: true
+            is_pypy: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e ".[test]"
+        if: matrix.is_pypy == false
+      - run: python -m pip install --upgrade pip setuptools wheel pytest
+        if: matrix.is_pypy
+      - run: python -m pytest -vv -ra --tb=long --junitxml=pytest-${{ matrix.python-version }}.xml
+        if: matrix.is_pypy == false
+      - run: python -m pytest tests/test_pypy_compat.py -vv -ra --tb=long -p no:cacheprovider --junitxml=pytest-${{ matrix.python-version }}.xml
+        if: matrix.is_pypy
+        env:
+          PYTHONPATH: src
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pytest-report-${{ matrix.python-version }}
+          path: pytest-*.xml
+          if-no-files-found: ignore

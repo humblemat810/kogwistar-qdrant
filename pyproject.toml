@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kogwistar-qdrant"
-version = "0.1.0"
+version = "0.5.0"
 description = "Qdrant adapter exposing Kogwistar's Chroma-shaped storage contract"
 requires-python = ">=3.12"
-dependencies = ["qdrant-client>=1.14,<2"]
+dependencies = ["qdrant-client>=1.14,<2; implementation_name != 'pypy'"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=1"]
+core = ["kogwistar>=0.5.0,<0.6.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

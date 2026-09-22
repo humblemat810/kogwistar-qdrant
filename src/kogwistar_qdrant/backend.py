@@ -1,10 +1,30 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Any, Iterator, Mapping, Sequence
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, AsyncIterator, Iterator, Mapping, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from qdrant_client import QdrantClient, models
+try:
+    from qdrant_client import QdrantClient, models
+except ImportError:  # PyPy provider-free compatibility lane
+    QdrantClient = None  # type: ignore[assignment]
+    models = None  # type: ignore[assignment]
+
+try:
+    from kogwistar.engine_core.embedding_profile import EmbeddingStorageState
+    from kogwistar.engine_core.storage_backend import TwoStageProjectionCapability
+except ImportError:
+    @dataclass(frozen=True)
+    class EmbeddingStorageState:
+        backend_kind: str
+        storage_scope: str
+        persistent: bool
+        vector_count: int
+        details: tuple[str, ...] = ()
 
 COLLECTIONS = (
     "node_index", "node", "edge", "edge_endpoints", "document", "domain",
@@ -12,14 +32,71 @@ COLLECTIONS = (
 )
 DOCUMENT_KEY = "__gke_document"
 ID_KEY = "__gke_id"
+PENDING_KEY = "__gke_embedding_pending"
 DIMENSION = 3
 SENTINEL = [0.0] * DIMENSION
+
+
+def _require_qdrant() -> Any:
+    if QdrantClient is None:
+        raise RuntimeError("qdrant-client is unavailable on this interpreter; install provider dependencies on CPython")
+    return QdrantClient
 
 
 class NoopUnitOfWork:
     @contextmanager
     def transaction(self) -> Iterator[None]:
         yield
+
+
+class AsyncNoopUnitOfWork:
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        yield
+
+
+try:
+    from kogwistar.engine_core.storage_backend import TwoStageProjectionCapability
+except ImportError:
+    @dataclass(frozen=True)
+    class TwoStageProjectionCapability:
+        supports_two_stage: bool = False
+        reason: str = "Qdrant adapter has no canonical event/revision promotion"
+        canonical_event_replay: bool = False
+        canonical_read: bool = False
+        stage1_strategy: str = "none"
+        stage1_metadata_query: bool = False
+        stage1_cleanup: bool = False
+        stage2_semantic_projection: bool = False
+        revision_gated_promotion: bool = False
+        semantic_readiness_gate: bool = False
+        delete_reconciliation: bool = False
+        atomic_promotion: str = "eventual_reconcile"
+        def missing_contracts(self) -> tuple[str, ...]:
+            return () if self.is_complete() else ("two_stage_projection",)
+        def is_complete(self) -> bool:
+            return all((self.supports_two_stage, self.canonical_event_replay, self.canonical_read, self.stage2_semantic_projection, self.revision_gated_promotion, self.semantic_readiness_gate, self.delete_reconciliation))
+
+
+def _awaitable(value: Any) -> Any:
+    class AwaitableValue:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+        def __await__(self):
+            async def done() -> Any:
+                return self.value
+            return done().__await__()
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.value, name)
+        def __getitem__(self, key: Any) -> Any:
+            return self.value[key]
+        def __iter__(self):
+            return iter(self.value)
+        def __len__(self) -> int:
+            return len(self.value)
+        def __eq__(self, other: Any) -> bool:
+            return self.value == other
+    return AwaitableValue(value)
 
 
 def _condition(key: str, value: Any) -> models.Condition:
@@ -29,9 +106,13 @@ def _condition(key: str, value: Any) -> models.Condition:
     for op, item in value.items():
         if op == "$in":
             parts.append(models.FieldCondition(key=key, match=models.MatchAny(any=list(item))))
+        elif op == "$eq":
+            parts.append(models.FieldCondition(key=key, match=models.MatchValue(value=item)))
         elif op in {"$gt", "$gte", "$lt", "$lte"}:
             field = op[1:]
             parts.append(models.FieldCondition(key=key, range=models.Range(**{field: item})))
+        elif op == "$contains":
+            parts.append(models.FieldCondition(key=key, match=models.MatchValue(value=item)))
         else:
             raise ValueError(f"unsupported where operator: {op}")
     if len(parts) != 1:
@@ -56,6 +137,7 @@ def _filter(where: Mapping[str, Any] | None) -> models.Filter | None:
             must_not.append(models.FieldCondition(key=key, match=models.MatchValue(value=value["$ne"])))
         else:
             must.append(_condition(key, value))
+    must_not.append(models.FieldCondition(key=PENDING_KEY, match=models.MatchValue(value=True)))
     return models.Filter(must=must or None, must_not=must_not or None, should=should or None)
 
 
@@ -70,19 +152,58 @@ class QdrantBackend:
     supports_transactions = False
     consistency = "eventual"
 
-    def __init__(self, client: QdrantClient, *, prefix: str = "kogwistar", dimension: int = DIMENSION):
+    def __init__(self, client: QdrantClient, *, prefix: str = "kogwistar", dimension: int = DIMENSION, storage_scope: str | None = None, persistent: bool = True, engine: Any | None = None):
         self.client, self.prefix, self.dimension = client, prefix, dimension
         self.uow = NoopUnitOfWork()
+        self.unit_of_work = self.uow
+        self.async_unit_of_work = AsyncNoopUnitOfWork()
+        self.engine = engine
+        self.two_stage_projection_capability = TwoStageProjectionCapability(
+            supports_two_stage=True,
+            canonical_event_replay=True,
+            canonical_read=True,
+            stage1_strategy="none",
+            stage2_semantic_projection=True,
+            revision_gated_promotion=True,
+            semantic_readiness_gate=True,
+            delete_reconciliation=True,
+            atomic_promotion="eventual_reconcile",
+            reason="Qdrant staged sentinel row with SQL/eventual reconciliation",
+        )
+        self.two_stage_projection_adapter = _QdrantTwoStageProjectionAdapter(self) if engine is not None else None
+        self.async_two_stage_projection_adapter = _AsyncQdrantTwoStageProjectionAdapter(self) if engine is not None else None
+        self._storage_scope = storage_scope or f"qdrant:{prefix}"
+        self._persistent = persistent
         self._ensure_collections()
 
     @classmethod
     def local(cls, path: str | None = None, **kwargs: Any) -> "QdrantBackend":
-        client = QdrantClient(location=":memory:") if path is None else QdrantClient(path=path)
-        return cls(client, **kwargs)
+        client_type = _require_qdrant()
+        client = client_type(location=":memory:") if path is None else client_type(path=path)
+        scope = f"qdrant:memory:{kwargs.get('prefix', 'kogwistar')}" if path is None else f"qdrant:path:{hashlib.sha256(str(Path(path).resolve()).encode()).hexdigest()[:16]}"
+        return cls(client, storage_scope=scope, persistent=path is not None, **kwargs)
 
     @classmethod
     def remote(cls, url: str, **kwargs: Any) -> "QdrantBackend":
-        return cls(QdrantClient(url=url), **kwargs)
+        client_type = _require_qdrant()
+        scope = f"qdrant:url:{hashlib.sha256(url.encode()).hexdigest()[:16]}"
+        return cls(client_type(url=url), storage_scope=scope, persistent=True, **kwargs)
+
+    def embedding_storage_scope(self) -> str:
+        return self._storage_scope
+
+    def embedding_storage_scope_aliases(self) -> tuple[str, ...]:
+        return ()
+
+    def bind_engine(self, engine: Any) -> "QdrantBackend":
+        self.engine = engine
+        self.two_stage_projection_adapter = _QdrantTwoStageProjectionAdapter(self)
+        self.async_two_stage_projection_adapter = _AsyncQdrantTwoStageProjectionAdapter(self)
+        return self
+
+    def inspect_embedding_storage(self) -> dict[str, Any]:
+        counts = {key: int(self.client.count(self._name(key), exact=True).count) for key in ("node_index", "node", "edge", "document", "domain")}
+        return EmbeddingStorageState(backend_kind="qdrant", storage_scope=self._storage_scope, persistent=self._persistent, vector_count=sum(counts.values()), details=tuple(f"{key}={count}" for key, count in counts.items()))
 
     def _name(self, key: str) -> str:
         return f"{self.prefix}_{key}"
@@ -104,6 +225,8 @@ class QdrantBackend:
         payload = dict(metadata)
         payload[DOCUMENT_KEY] = document
         payload[ID_KEY] = id_
+        if vector is None:
+            payload[PENDING_KEY] = True
         return models.PointStruct(id=str(uuid5(NAMESPACE_URL, f"kogwistar:{id_}")), vector=list(vector or [0.0] * self.dimension), payload=payload)
 
     @staticmethod
@@ -122,6 +245,7 @@ class QdrantBackend:
         payload = dict(point.payload or {})
         document = payload.pop(DOCUMENT_KEY, None)
         payload.pop(ID_KEY, None)
+        payload.pop(PENDING_KEY, None)
         return document, payload
 
     @staticmethod
@@ -135,7 +259,8 @@ class QdrantBackend:
             document, metadata = self._payload(point)
             docs.append(document)
             metas.append(metadata)
-            vectors.append(list(point.vector) if point.vector is not None and not isinstance(point.vector, dict) else None)
+            pending = bool((point.payload or {}).get(PENDING_KEY))
+            vectors.append(None if pending else (list(point.vector) if point.vector is not None and not isinstance(point.vector, dict) else None))
         out: dict[str, Any] = {"ids": [self._external_id(point) for point in points]}
         if "documents" in include:
             out["documents"] = docs
@@ -149,14 +274,24 @@ class QdrantBackend:
         inc = self._include(include)
         provider_ids = [self._provider_id(id_) for id_ in ids] if ids is not None else None
         points = self.client.retrieve(collection_name=self._name(key), ids=provider_ids, with_payload=True, with_vectors=("embeddings" in inc)) if provider_ids is not None else self._scroll(key, where, limit, inc)
-        return self._flat(points, inc)
+        result = self._flat(points, inc)
+        if provider_ids is not None:
+            order = {id_: n for n, id_ in enumerate(result["ids"])}
+            indexes = [order[id_] for id_ in ids if id_ in order]
+            for name, values in list(result.items()):
+                if name != "ids":
+                    result[name] = [values[n] for n in indexes]
+            result["ids"] = [result["ids"][n] for n in indexes]
+        return _awaitable(result)
 
     def query(self, key: str, *, query_embeddings: Sequence[Sequence[float]] | None = None, n_results: int = 10, where: Mapping[str, Any] | None = None, include: Sequence[str] | None = None) -> dict[str, Any]:
         inc = self._include(include) | {"documents", "metadatas"}
         if query_embeddings is None:
             flat = self._flat(self._scroll(key, where, n_results, inc), inc)
-            return {name: [value] for name, value in flat.items()}
-        batches = [self.client.query_points(collection_name=self._name(key), query=list(vector), query_filter=_filter(where), limit=n_results, with_payload=True, with_vectors=("embeddings" in inc)).points for vector in query_embeddings]
+            return _awaitable({name: [value] for name, value in flat.items()})
+        semantic_where = dict(where or {})
+        semantic_where[PENDING_KEY] = {"$ne": True}
+        batches = [self.client.query_points(collection_name=self._name(key), query=list(vector), query_filter=_filter(semantic_where), limit=n_results, with_payload=True, with_vectors=("embeddings" in inc)).points for vector in query_embeddings]
         out: dict[str, Any] = {"ids": [[self._external_id(point) for point in batch] for batch in batches]}
         if "documents" in inc:
             out["documents"] = [[self._payload(point)[0] for point in batch] for batch in batches]
@@ -164,17 +299,19 @@ class QdrantBackend:
             out["metadatas"] = [[self._payload(point)[1] for point in batch] for batch in batches]
         if "distances" in inc:
             out["distances"] = [[1.0 - float(point.score) for point in batch] for batch in batches]
-        return out
+        return _awaitable(out)
 
     def upsert(self, key: str, *, ids: Sequence[str], documents: Sequence[str], metadatas: Sequence[Mapping[str, Any]], embeddings: Sequence[Sequence[float]] | None = None) -> None:
-        vectors = embeddings or [[0.0] * self.dimension for _ in ids]
+        vectors = list(embeddings) if embeddings is not None else [None] * len(ids)
         points = [self._point(i, d, m, v) for i, d, m, v in zip(ids, documents, metadatas, vectors, strict=True)]
-        self.client.upsert(collection_name=self._name(key), points=points, wait=True)
+        return _awaitable(self.client.upsert(collection_name=self._name(key), points=points, wait=True))
 
     add = upsert
 
     def update(self, key: str, *, ids: Sequence[str], documents: Sequence[str | None] | None = None, metadatas: Sequence[Mapping[str, Any]] | None = None, embeddings: Sequence[Sequence[float]] | None = None) -> None:
         old = self.get(key, ids=ids, include=["documents", "metadatas", "embeddings"])
+        if hasattr(old, "value"):
+            old = old.value
         positions = {id_: n for n, id_ in enumerate(old["ids"])}
         for n, id_ in enumerate(ids):
             if id_ not in positions:
@@ -186,11 +323,13 @@ class QdrantBackend:
             document = documents[n] if documents is not None and documents[n] is not None else old["documents"][old_n]
             vector = embeddings[n] if embeddings is not None else old["embeddings"][old_n]
             self.upsert(key, ids=[id_], documents=[document], metadatas=[metadata], embeddings=[vector])
+        return _awaitable(None)
 
     def delete(self, key: str, *, ids: Sequence[str] | None = None, where: Mapping[str, Any] | None = None) -> None:
         target_ids = [self._provider_id(id_) for id_ in ids] if ids is not None else [str(point.id) for point in self._scroll(key, where, 10000, set())]
         if target_ids:
-            self.client.delete(collection_name=self._name(key), points_selector=models.PointIdsList(points=target_ids), wait=True)
+            return _awaitable(self.client.delete(collection_name=self._name(key), points_selector=models.PointIdsList(points=target_ids), wait=True))
+        return _awaitable(None)
 
     def call(self, collection_key: str, method: str, **kwargs: Any) -> Any:
         if collection_key not in COLLECTIONS or method not in {"get", "query", "add", "upsert", "update", "delete"}:
@@ -203,3 +342,97 @@ class QdrantBackend:
                 method = name[len(key) + 1:]
                 return lambda **kwargs: getattr(self, method)(key, **kwargs)
         raise AttributeError(name)
+
+
+class _QdrantTwoStageProjectionAdapter:
+    def __init__(self, backend: QdrantBackend) -> None:
+        self.backend = backend
+
+    @property
+    def engine(self) -> Any:
+        if self.backend.engine is None:
+            raise RuntimeError("Qdrant two-stage adapter requires an engine")
+        return self.backend.engine
+
+    def _enqueue(self, *, entity_kind: str, entity_id: str, op: str) -> None:
+        indexing = getattr(self.engine, "indexing", None)
+        if indexing is None:
+            raise RuntimeError("Qdrant two-stage adapter requires engine indexing")
+        indexing.enqueue_index_job(
+            entity_kind=entity_kind,
+            entity_id=entity_id,
+            index_kind=f"{entity_kind}_embedding",
+            op=op,
+            payload_json=indexing.canonical_revision_payload(entity_kind=entity_kind, entity_id=entity_id),
+        )
+
+    def add_node(self, node: Any, *, doc_id: str | None = None) -> None:
+        if doc_id is not None:
+            node.doc_id = doc_id
+        doc, meta = self.engine.write.node_doc_and_meta(node)
+        self.backend.node_upsert(ids=[node.safe_get_id()], documents=[doc], metadatas=[meta], embeddings=[None])
+        self._enqueue(entity_kind="node", entity_id=node.safe_get_id(), op="UPSERT")
+
+    def add_edge(self, edge: Any, *, doc_id: str | None = None) -> None:
+        if doc_id is not None:
+            edge.doc_id = doc_id
+        doc = edge.model_dump_json(field_mode="backend", exclude=["embedding"])
+        meta = self.engine.write.enrich_edge_meta(edge)
+        self.backend.edge_upsert(ids=[edge.safe_get_id()], documents=[str(doc)], metadatas=[meta], embeddings=[None])
+        self._enqueue(entity_kind="edge", entity_id=edge.safe_get_id(), op="UPSERT")
+
+    def stage1_query(self, *, entity_kind: str, ids: Sequence[str] | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        result = getattr(self.backend, f"{entity_kind}_get")(ids=ids, include=["documents", "metadatas"], limit=limit)
+        rows = []
+        for n, entity_id in enumerate(result.get("ids", [])):
+            rows.append({"entity_id": entity_id, "document": (result.get("documents") or [None])[n], "metadata": (result.get("metadatas") or [{}])[n]})
+        return rows
+
+    def apply_embedding_job(self, *, entity_kind: str, entity_id: str, op: str, payload_json: str | None) -> None:
+        if entity_kind not in {"node", "edge"}:
+            raise ValueError(f"unsupported two-stage entity kind: {entity_kind!r}")
+        if op.upper() == "DELETE":
+            getattr(self.backend, f"{entity_kind}_delete")(ids=[entity_id])
+            return
+        current = getattr(self.backend, f"{entity_kind}_get")(ids=[entity_id], include=["documents", "metadatas"])
+        if not current.get("ids"):
+            return
+        expected = str(json.loads(payload_json or "{}").get("source_fingerprint", ""))
+        actual = self.engine.indexing.canonical_revision_payload(entity_kind=entity_kind, entity_id=entity_id)
+        if expected and expected != str(json.loads(actual).get("source_fingerprint", "")):
+            return
+        document = (current.get("documents") or [""])[0] or ""
+        embedding = self.engine.embed.iterative_defensive_emb(str(document))
+        getattr(self.backend, f"{entity_kind}_update")(ids=[entity_id], embeddings=[embedding])
+
+    def apply_embedding_jobs_batch(self, jobs: list[Any]) -> dict[str, BaseException | None]:
+        outcomes: dict[str, BaseException | None] = {}
+        for job in jobs:
+            value = lambda name: job.get(name) if isinstance(job, dict) else getattr(job, name, None)
+            job_id = str(value("job_id") or "")
+            try:
+                self.apply_embedding_job(entity_kind=str(value("entity_kind")), entity_id=str(value("entity_id")), op=str(value("op") or "UPSERT"), payload_json=value("payload_json"))
+                outcomes[job_id] = None
+            except BaseException as exc:
+                outcomes[job_id] = exc
+        return outcomes
+
+    def reconcile_projection(self) -> int:
+        return 0
+
+
+class _AsyncQdrantTwoStageProjectionAdapter(_QdrantTwoStageProjectionAdapter):
+    async def stage1_query(self, *, entity_kind: str, ids: Sequence[str] | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        return super().stage1_query(entity_kind=entity_kind, ids=ids, limit=limit)
+
+    async def add_node(self, node: Any, *, doc_id: str | None = None) -> None:
+        super().add_node(node, doc_id=doc_id)
+
+    async def add_edge(self, edge: Any, *, doc_id: str | None = None) -> None:
+        super().add_edge(edge, doc_id=doc_id)
+
+    async def apply_embedding_job(self, *, entity_kind: str, entity_id: str, op: str, payload_json: str | None) -> None:
+        super().apply_embedding_job(entity_kind=entity_kind, entity_id=entity_id, op=op, payload_json=payload_json)
+
+    async def apply_embedding_jobs_batch(self, jobs: list[Any]) -> dict[str, BaseException | None]:
+        return super().apply_embedding_jobs_batch(jobs)
