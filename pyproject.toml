@@ -7,10 +7,11 @@ name = "kogwistar-qdrant"
 version = "0.5.0"
 description = "Qdrant adapter exposing Kogwistar's Chroma-shaped storage contract"
 requires-python = ">=3.12"
-dependencies = ["kogwistar>=0.5.0,<0.6.0", "qdrant-client>=1.14,<2"]
+dependencies = ["qdrant-client>=1.14,<2"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=1"]
+core = ["kogwistar>=0.5.0,<0.6.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
